@@ -1,6 +1,6 @@
 use crate::transaction::{Transaction, TransactionType};
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClientState {
     pub id: u16,
     pub available: f32,
@@ -44,66 +44,78 @@ impl Client {
             .find(|t| t.r#type == TransactionType::Dispute && t.tx == tx)
     }
 
+    fn process_withdrawal(&self, transaction: Transaction, mut state: ClientState) -> ClientState {
+        if state.available >= transaction.amount {
+            state.available -= transaction.amount;
+            state.total -= transaction.amount;
+        }
+        state
+    }
+
+    fn process_deposit(&self, transaction: Transaction, mut state: ClientState) -> ClientState {
+        state.available += transaction.amount;
+        state.total += transaction.amount;
+        state
+    }
+
+    fn process_dispute(&self, transaction: Transaction, mut state: ClientState) -> ClientState {
+        if let Some(disputed_transaction) = self.find_transaction(transaction.tx) {
+            if disputed_transaction.r#type == TransactionType::Withdrawal {
+                state.available -= -disputed_transaction.amount;
+                state.held += -disputed_transaction.amount;
+            } else if disputed_transaction.r#type == TransactionType::Deposit {
+                state.available -= disputed_transaction.amount;
+                state.held += disputed_transaction.amount;
+            }
+        }
+        state
+    }
+
+    fn process_resolve(&self, transaction: Transaction, mut state: ClientState) -> ClientState {
+        let disputed_transaction = self.find_transaction(transaction.tx);
+        let pending_dispute = self.find_dispute(transaction.tx);
+        if let Some(disputed_transaction) = disputed_transaction {
+            if let Some(_) = pending_dispute {
+                state.held -= disputed_transaction.amount;
+                state.available += disputed_transaction.amount;
+            }
+        }
+        state
+    }
+
+    fn process_chargeback(&self, transaction: Transaction, mut state: ClientState) -> ClientState {
+        let disputed_transaction = self.find_transaction(transaction.tx);
+        let pending_dispute = self.find_dispute(transaction.tx);
+        if let Some(disputed_transaction) = disputed_transaction {
+            if let Some(_) = pending_dispute {
+                state.held -= disputed_transaction.amount;
+                state.total -= disputed_transaction.amount;
+                state.locked = true;
+            }
+        }
+        state
+    }
+
     pub fn calculate_state(&self) -> ClientState {
-        let mut available: f32 = 0.0;
-        let mut held: f32 = 0.0;
-        let mut total: f32 = 0.0;
-        let mut locked = false;
+        let mut state = ClientState {
+            id: self.id,
+            available: 0.0,
+            held: 0.0,
+            total: 0.0,
+            locked: false,
+        };
 
         for transaction in &self.transactions {
             match transaction.r#type {
-                TransactionType::Deposit => {
-                    available += transaction.amount;
-                    total += transaction.amount;
-                }
-                TransactionType::Withdrawal => {
-                    if available >= transaction.amount {
-                        available -= transaction.amount;
-                        total -= transaction.amount;
-                    }
-                }
-                TransactionType::Dispute => {
-                    if let Some(disputed_transaction) = self.find_transaction(transaction.tx) {
-                        if disputed_transaction.r#type == TransactionType::Withdrawal {
-                            available -= -disputed_transaction.amount;
-                            held += -disputed_transaction.amount;
-                        } else if disputed_transaction.r#type == TransactionType::Deposit {
-                            available -= disputed_transaction.amount;
-                            held += disputed_transaction.amount;
-                        }
-                    }
-                }
-                TransactionType::Resolve => {
-                    let disputed_transaction = self.find_transaction(transaction.tx);
-                    let pending_dispute = self.find_dispute(transaction.tx);
-                    if let Some(disputed_transaction) = disputed_transaction {
-                        if let Some(_) = pending_dispute {
-                            held -= disputed_transaction.amount;
-                            available += disputed_transaction.amount;
-                        }
-                    }
-                }
-                TransactionType::Chargeback => {
-                    let disputed_transaction = self.find_transaction(transaction.tx);
-                    let pending_dispute = self.find_dispute(transaction.tx);
-                    if let Some(disputed_transaction) = disputed_transaction {
-                        if let Some(_) = pending_dispute {
-                            held -= disputed_transaction.amount;
-                            total -= disputed_transaction.amount;
-                            locked = true;
-                        }
-                    }
-                }
+                TransactionType::Deposit => state = self.process_deposit(*transaction, state),
+                TransactionType::Withdrawal => state = self.process_withdrawal(*transaction, state),
+                TransactionType::Dispute => state = self.process_dispute(*transaction, state),
+                TransactionType::Resolve => state = self.process_resolve(*transaction, state),
+                TransactionType::Chargeback => state = self.process_chargeback(*transaction, state),
             }
         }
 
-        ClientState {
-            id: self.id,
-            available,
-            held,
-            total,
-            locked,
-        }
+        state
     }
 }
 
