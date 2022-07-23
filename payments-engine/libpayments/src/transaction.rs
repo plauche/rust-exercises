@@ -1,6 +1,5 @@
-use serde::{Deserialize, Serialize};
-
 use crate::client::ClientState;
+use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -17,7 +16,7 @@ pub struct Transaction {
     pub r#type: TransactionType,
     pub client: u16,
     pub tx: u32,
-    pub amount: f32,
+    pub amount: Option<f32>,
 }
 
 impl Transaction {
@@ -32,27 +31,37 @@ impl Transaction {
     }
 
     fn process_withdrawal(&self, mut state: ClientState) -> ClientState {
-        if state.available >= self.amount {
-            state.available -= self.amount;
-            state.total -= self.amount;
+        if let Some(amount) = self.amount {
+            if state.available >= amount {
+                state.available -= amount;
+                state.total -= amount;
+            }
         }
         state
     }
 
     fn process_deposit(&self, mut state: ClientState) -> ClientState {
-        state.available += self.amount;
-        state.total += self.amount;
+        if let Some(amount) = self.amount {
+            state.available += amount;
+            state.total += amount;
+        }
         state
     }
 
     fn process_dispute(&self, mut state: ClientState, log: &[Transaction]) -> ClientState {
         if let Some(disputed_transaction) = find_transaction(log, self.tx) {
-            if disputed_transaction.r#type == TransactionType::Withdrawal {
-                state.available -= -disputed_transaction.amount;
-                state.held += -disputed_transaction.amount;
-            } else if disputed_transaction.r#type == TransactionType::Deposit {
-                state.available -= disputed_transaction.amount;
-                state.held += disputed_transaction.amount;
+            if let Some(amount) = disputed_transaction.amount {
+                // The assumption was made that when disputing/resolving/charging back transactions
+                // that withdrawal and deposits should be treated as essentially "opposite" transactions
+                // which means the the effects of a dispute/resolve/chargeback are reversed
+                // between a deposit and withdrawal
+                if disputed_transaction.r#type == TransactionType::Withdrawal {
+                    state.available += amount;
+                    state.held -= amount;
+                } else if disputed_transaction.r#type == TransactionType::Deposit {
+                    state.available -= amount;
+                    state.held += amount;
+                }
             }
         }
         state
@@ -64,12 +73,14 @@ impl Transaction {
         let prior_chargeback = find_chargeback(log, self.tx);
         if let Some(disputed_transaction) = disputed_transaction {
             if pending_dispute.is_some() && prior_chargeback.is_none() {
-                if disputed_transaction.r#type == TransactionType::Withdrawal {
-                    state.held += disputed_transaction.amount;
-                    state.available -= disputed_transaction.amount;
-                } else if disputed_transaction.r#type == TransactionType::Deposit {
-                    state.held -= disputed_transaction.amount;
-                    state.available += disputed_transaction.amount;
+                if let Some(amount) = disputed_transaction.amount {
+                    if disputed_transaction.r#type == TransactionType::Withdrawal {
+                        state.held += amount;
+                        state.available -= amount;
+                    } else if disputed_transaction.r#type == TransactionType::Deposit {
+                        state.held -= amount;
+                        state.available += amount;
+                    }
                 }
             }
         }
@@ -82,14 +93,16 @@ impl Transaction {
         let prior_resolve = find_resolve(log, self.tx);
         if let Some(disputed_transaction) = disputed_transaction {
             if pending_dispute.is_some() && prior_resolve.is_none() {
-                if disputed_transaction.r#type == TransactionType::Withdrawal {
-                    state.held += disputed_transaction.amount;
-                    state.total += disputed_transaction.amount;
-                } else if disputed_transaction.r#type == TransactionType::Deposit {
-                    state.held -= disputed_transaction.amount;
-                    state.total -= disputed_transaction.amount;
+                if let Some(amount) = disputed_transaction.amount {
+                    if disputed_transaction.r#type == TransactionType::Withdrawal {
+                        state.held += amount;
+                        state.total += amount;
+                    } else if disputed_transaction.r#type == TransactionType::Deposit {
+                        state.held -= amount;
+                        state.total -= amount;
+                    }
+                    state.locked = true;
                 }
-                state.locked = true;
             }
         }
         state
@@ -126,15 +139,16 @@ fn find_chargeback(log: &[Transaction], tx: u32) -> Option<Transaction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::ClientState;
+    use crate::client::{calc_state, ClientState};
     use crate::transaction::TransactionType;
 
+    // Helper functions for creating test transactions
     fn deposit(tx: u32, amount: f32) -> Transaction {
         Transaction {
             r#type: TransactionType::Deposit,
             client: 0,
             tx,
-            amount,
+            amount: Some(amount),
         }
     }
 
@@ -143,7 +157,7 @@ mod tests {
             r#type: TransactionType::Withdrawal,
             client: 0,
             tx,
-            amount,
+            amount: Some(amount),
         }
     }
 
@@ -152,7 +166,7 @@ mod tests {
             r#type: TransactionType::Dispute,
             client: 0,
             tx,
-            amount: 0.0,
+            amount: None,
         }
     }
 
@@ -161,7 +175,7 @@ mod tests {
             r#type: TransactionType::Resolve,
             client: 0,
             tx,
-            amount: 0.0,
+            amount: None,
         }
     }
 
@@ -170,23 +184,11 @@ mod tests {
             r#type: TransactionType::Chargeback,
             client: 0,
             tx,
-            amount: 0.0,
+            amount: None,
         }
     }
 
-    fn calc_state(transactions: Vec<Transaction>) -> ClientState {
-        let mut state = ClientState::default();
-        for (position, transaction) in transactions.iter().enumerate() {
-            state = transaction.process(state, &transactions[..(position)]);
-        }
-        state
-        // transactions
-        //     .iter()
-        //     .fold(ClientState::default(), |state, t| {
-        //         t.process(state, &transactions)
-        //     })
-    }
-
+    // Actual test cases
     #[test]
     fn test_deposit_withdrawl_ok() {
         let transactions = vec![deposit(1, 5.0), withdrawal(2, 3.5)];
@@ -197,7 +199,7 @@ mod tests {
             held: 0.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -210,7 +212,7 @@ mod tests {
             held: 10.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -224,7 +226,7 @@ mod tests {
             held: 0.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -238,7 +240,7 @@ mod tests {
             held: 0.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -252,7 +254,7 @@ mod tests {
             held: 0.0,
             locked: true,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -266,7 +268,7 @@ mod tests {
             held: -5.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -280,7 +282,7 @@ mod tests {
             held: 0.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -299,7 +301,7 @@ mod tests {
             held: 0.0,
             locked: true,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -313,7 +315,7 @@ mod tests {
             held: 0.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -326,7 +328,7 @@ mod tests {
             held: 10.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -339,7 +341,7 @@ mod tests {
             held: 10.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -352,7 +354,7 @@ mod tests {
             held: 0.0,
             locked: true,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 
     #[test]
@@ -365,6 +367,27 @@ mod tests {
             held: 0.0,
             locked: false,
         };
-        assert_eq!(calc_state(transactions), expected_state);
+        assert_eq!(calc_state(&transactions), expected_state);
+    }
+
+    #[test]
+    fn test_ignore_after_chargeback() {
+        let transactions = vec![
+            deposit(1, 10.0),
+            withdrawal(2, 5.0),
+            dispute(2),
+            chargeback(2),
+            deposit(3, 20.0),
+            withdrawal(4, 1.5),
+        ];
+
+        let expected_state = ClientState {
+            id: 0,
+            available: 10.0,
+            total: 10.0,
+            held: 0.0,
+            locked: true,
+        };
+        assert_eq!(calc_state(&transactions), expected_state);
     }
 }
